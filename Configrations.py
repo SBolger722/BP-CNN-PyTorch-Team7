@@ -15,9 +15,9 @@ class TopConfig:
         # noise information
         self.blk_len = self.N_code
         self.corr_para = 0.5  # correlation parameters of the colored noise
-        self.corr_para_simu = self.corr_para  # correlation parameters for simulation. this should be equal to corr_para. If not, it is used to test the model robustness.
+        self.corr_para_simu = 0.5  # correlation parameters for simulation. this should be equal to corr_para. If not, it is used to test the model robustness.
         self.cov_1_2_file = format('./Noise/cov_1_2_corr_para%.2f.dat'% self.corr_para)
-        self.cov_1_2_file_simu = self.cov_1_2_file
+        self.cov_1_2_file_simu =  format('./Noise/cov_1_2_corr_para%.2f.dat'% self.corr_para_simu)
 
         # BP decoding
         self.BP_iter_nums_gen_data = np.array([5])     # the number of BP iterations
@@ -148,10 +148,10 @@ class TrainingConfig:
         self.currently_trained_net_id = top_config.currently_trained_net_id
 
         # training data information
-        self.training_sample_num = 1999200    # the number of training samples. It should be a multiple of training_minibatch_size
+        self.training_sample_num = 19992    # the number of training samples. It should be a multiple of training_minibatch_size
         # training parameters
-        self.epoch_num = 200000  # the number of training iterations.
-        self.training_minibatch_size = 1400  # one mini-batch contains equal amount of data generated under different CSNR.
+        self.epoch_num = 2000  # the number of training iterations.
+        self.training_minibatch_size = 14  # one mini-batch contains equal amount of data generated under different CSNR.
         self.SNR_set_gen_data = top_config.SNR_set_gen_data
         # the data in the feature file is the network input.
         # the data in the label file is the ground truth.
@@ -159,8 +159,8 @@ class TrainingConfig:
         self.training_label_file = "./TrainingData/RealNoise.dat"
 
         # test data information
-        self.test_sample_num = 105000 # it should be a multiple of test_minibatch_size
-        self.test_minibatch_size = 3500
+        self.test_sample_num = 1050 # it should be a multiple of test_minibatch_size
+        self.test_minibatch_size = 35
         self.test_feature_file = format("./TestData/EstNoise_before_cnn%d.dat" % (self.currently_trained_net_id))
         self.test_label_file = "./TestData/RealNoise.dat"
 

@@ -2,16 +2,22 @@
 # The denoising is implemented through CNN.
 # The system architecture can be briefly denoted as BP-CNN-BP-CNN-BP...
 
+# This file contains some functions used to implement an iterative BP and denoising system for channel decoding.
+# The denoising is implemented through CNN.
+# The system architecture can be briefly denoted as BP-CNN-BP-CNN-BP...
+
 import numpy as np
 import datetime
 import BP_Decoder
-import tensorflow as tf
+import torch
 import ConvNet
 import LinearBlkCodes as lbc
 import DataIO
 
+# Check device availability
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# emprical distribution
+# emprical distribution (Pure NumPy - Unchanged)
 def stat_prob(x, prob):
     qstep = 0.01
     min_v = -10
@@ -25,10 +31,22 @@ def stat_prob(x, prob):
     return prob
 
 # denoising and calculate LLR for next decoding
-def denoising_and_calc_LLR_awgn(res_noise_power, y_receive, output_pre_decoder, net_in, net_out, sess):
+# CHANGED: Replaced sess, net_in, net_out with model and device
+def denoising_and_calc_LLR_awgn(res_noise_power, y_receive, output_pre_decoder, model, device_in):
     # estimate noise with cnn denoiser
     noise_before_cnn = y_receive - (output_pre_decoder * (-2) + 1)
-    noise_after_cnn = sess.run(net_out, feed_dict={net_in: noise_before_cnn})
+    
+    # Convert to Tensor for PyTorch Model
+    noise_tensor = torch.from_numpy(noise_before_cnn).float().to(device_in)
+    
+    # Inference
+    model.eval()
+    with torch.no_grad():
+        noise_after_cnn_tensor = model(noise_tensor)
+    
+    # Convert back to Numpy
+    noise_after_cnn = noise_after_cnn_tensor.cpu().numpy()
+    
     # calculate the LLR for next BP decoding
     s_mod_plus_res_noise = y_receive - noise_after_cnn
     LLR = s_mod_plus_res_noise * 2.0 / res_noise_power
@@ -48,10 +66,21 @@ def calc_LLR_epdf(prob, s_mod_plus_res_noise):
     LLR = np.log(np.divide(p0 + 1e-7, p1 + 1e-7))
     return LLR
 
-def denoising_and_calc_LLR_epdf(prob, y_receive, output_pre_decoder, net_in, net_out, sess):
+# CHANGED: Replaced sess, net_in, net_out with model and device
+def denoising_and_calc_LLR_epdf(prob, y_receive, output_pre_decoder, model, device_in):
     # estimate noise with cnn denoiser
     noise_before_cnn = y_receive - (output_pre_decoder * (-2) + 1)
-    noise_after_cnn = sess.run(net_out, feed_dict={net_in: noise_before_cnn})
+    
+    # Tensor conversion
+    noise_tensor = torch.from_numpy(noise_before_cnn).float().to(device_in)
+    
+    # Inference
+    model.eval()
+    with torch.no_grad():
+        noise_after_cnn_tensor = model(noise_tensor)
+    
+    noise_after_cnn = noise_after_cnn_tensor.cpu().numpy()
+    
     # calculate the LLR for next BP decoding
     s_mod_plus_res_noise = y_receive - noise_after_cnn
     LLR = calc_LLR_epdf(prob, s_mod_plus_res_noise)
@@ -66,6 +95,7 @@ def simulation_colored_noise(linear_code, top_config, net_config, simutimes_rang
     ## load configurations from top_config
     SNRset = top_config.eval_SNRs
     bp_iter_num = top_config.BP_iter_nums_simu
+    # Note: NoiseIO was converted to pure Numpy, so this works as is
     noise_io = DataIO.NoiseIO(top_config.N_code, False, None, top_config.cov_1_2_file_simu, rng_seed=0)
     denoising_net_num = top_config.cnn_net_number
     model_id = top_config.model_id
@@ -78,31 +108,29 @@ def simulation_colored_noise(linear_code, top_config, net_config, simutimes_rang
     if np.size(bp_iter_num) != denoising_net_num + 1:
         print('Error: the length of bp_iter_num is not correct!')
         exit(0)
-    bp_decoder = BP_Decoder.BP_NetDecoder(H_matrix, batch_size)
+    
+    # PyTorch BP Decoder
+    bp_decoder = BP_Decoder.BP_NetDecoder(H_matrix, batch_size).to(device)
 
     ## build denoising network
-    conv_net = {}
-    denoise_net_in = {}
-    denoise_net_out = {}
+    conv_net_wrappers = {}
+    cnn_models = {}
+    
     # build network for each CNN denoiser,
     for net_id in range(denoising_net_num):
+        # Create Wrapper (for config/restore logic)
+        conv_net_wrappers[net_id] = ConvNet.ConvNet(net_config, None, net_id)
+        
         if top_config.same_model_all_nets and net_id > 0:
-            conv_net[net_id] = conv_net[0]
-            denoise_net_in[net_id] = denoise_net_in[0]
-            denoise_net_out[net_id] = denoise_net_out[0]
+            cnn_models[net_id] = cnn_models[0]
         else:
-            conv_net[net_id] = ConvNet.ConvNet(net_config, None, net_id)
-            denoise_net_in[net_id], denoise_net_out[net_id] = conv_net[net_id].build_network()
-    # init gragh
-    init = tf.global_variables_initializer()
-    sess = tf.Session()
-    print('Open a tf session!')
-    sess.run(init)
-    # restore denoising network
-    for net_id in range(denoising_net_num):
-        if top_config.same_model_all_nets and net_id > 0:
-            break
-        conv_net[net_id].restore_network_with_model_id(sess, net_config.total_layers, model_id[0:(net_id+1)])
+            # Instantiate PyTorch Model (accessing the internal class _CNNModel from ConvNet module)
+            cnn_models[net_id] = ConvNet._CNNModel(net_config).to(device)
+            cnn_models[net_id].eval() # Set to eval mode
+
+            # restore denoising network
+            # Note: Converted ConvNet.py restore_network signature is (model, layers, id)
+            conv_net_wrappers[net_id].restore_network_with_model_id(cnn_models[net_id], net_config.total_layers, model_id[0:(net_id+1)])
 
     ## initialize simulation times
     max_simutimes = simutimes_range[1]
@@ -151,16 +179,18 @@ def simulation_colored_noise(linear_code, top_config, net_config, simutimes_rang
             print('Practical EbN0: %.2f' % practical_snr)
 
             for iter in range(0, denoising_net_num+1):
-                # BP decoding
+                # BP decoding (converted BP_decoder.decode handles numpy->tensor->numpy)
                 u_BP_decoded = bp_decoder.decode(LLR.astype(np.float32), bp_iter_num[iter])
 
                 if iter < denoising_net_num:
                     if top_config.update_llr_with_epdf:
-                        prob = conv_net[iter].get_res_noise_pdf(model_id).get(np.float32(SNR))
-                        LLR = denoising_and_calc_LLR_epdf(prob, y_receive, u_BP_decoded, denoise_net_in[iter], denoise_net_out[iter], sess)
+                        prob = conv_net_wrappers[iter].get_res_noise_pdf(model_id).get(np.float32(SNR))
+                        # Pass model instance and device instead of placeholders/session
+                        LLR = denoising_and_calc_LLR_epdf(prob, y_receive, u_BP_decoded, cnn_models[iter], device)
                     else:
-                        res_noise_power = conv_net[iter].get_res_noise_power(model_id, SNRset).get(np.float32(SNR))
-                        LLR = denoising_and_calc_LLR_awgn(res_noise_power, y_receive, u_BP_decoded, denoise_net_in[iter], denoise_net_out[iter], sess)
+                        res_noise_power = conv_net_wrappers[iter].get_res_noise_power(model_id, SNRset).get(np.float32(SNR))
+                        LLR = denoising_and_calc_LLR_awgn(res_noise_power, y_receive, u_BP_decoded, cnn_models[iter], device)
+                
                 output_x = linear_code.dec_src_bits(u_BP_decoded)
                 bit_errs_iter[iter] += np.sum(output_x != x_bits)
 
@@ -180,8 +210,7 @@ def simulation_colored_noise(linear_code, top_config, net_config, simutimes_rang
     end = datetime.datetime.now()
     print('Time: %ds' % (end-start).seconds)
     print("end\n")
-    sess.close()
-    print('Close the tf session!')
+    # sess.close() # Removed
 
 
 def generate_noise_samples(linear_code, top_config, net_config, train_config, bp_iter_num, net_id_data_for, generate_data_for, noise_io, model_id):
@@ -206,23 +235,19 @@ def generate_noise_samples(linear_code, top_config, net_config, train_config, bp
     if np.size(bp_iter_num) != net_id_data_for + 1:
         print('Error: the length of bp_iter_num is not correct!')
         exit(0)
-    bp_decoder = BP_Decoder.BP_NetDecoder(H_matrix, batch_size_each_SNR)
+    
+    # PyTorch BP Decoder
+    bp_decoder = BP_Decoder.BP_NetDecoder(H_matrix, batch_size_each_SNR).to(device)
 
-    conv_net = {}
-    denoise_net_in = {}
-    denoise_net_out = {}
+    conv_net_wrappers = {}
+    cnn_models = {}
+    
     for net_id in range(net_id_data_for):
-        conv_net[net_id] = ConvNet.ConvNet(net_config, None, net_id)
-        denoise_net_in[net_id], denoise_net_out[net_id] = conv_net[net_id].build_network()
-
-    # init gragh
-    init = tf.global_variables_initializer()
-    sess = tf.Session()
-    sess.run(init)
-
-    # restore cnn networks before the target CNN
-    for net_id in range(net_id_data_for):
-        conv_net[net_id].restore_network_with_model_id(sess, net_config.total_layers, model_id[0:(net_id+1)])
+        conv_net_wrappers[net_id] = ConvNet.ConvNet(net_config, None, net_id)
+        # Instantiate and restore
+        cnn_models[net_id] = ConvNet._CNNModel(net_config).to(device)
+        cnn_models[net_id].eval()
+        conv_net_wrappers[net_id].restore_network_with_model_id(cnn_models[net_id], net_config.total_layers, model_id[0:(net_id+1)])
 
     start = datetime.datetime.now()
 
@@ -246,11 +271,11 @@ def generate_noise_samples(linear_code, top_config, net_config, train_config, bp
 
                 if iter != net_id_data_for:
                     if top_config.update_llr_with_epdf:
-                        prob = conv_net[iter].get_res_noise_pdf(model_id).get(np.float32(SNR))
-                        LLR = denoising_and_calc_LLR_epdf(prob, y_receive, u_BP_decoded, denoise_net_in[iter], denoise_net_out[iter], sess)
+                        prob = conv_net_wrappers[iter].get_res_noise_pdf(model_id).get(np.float32(SNR))
+                        LLR = denoising_and_calc_LLR_epdf(prob, y_receive, u_BP_decoded, cnn_models[iter], device)
                     else:
-                        res_noise_power = conv_net[iter].get_res_noise_power(model_id).get(np.float32(SNR))
-                        LLR = denoising_and_calc_LLR_awgn(res_noise_power, y_receive, u_BP_decoded, denoise_net_in[iter], denoise_net_out[iter], sess)
+                        res_noise_power = conv_net_wrappers[iter].get_res_noise_power(model_id).get(np.float32(SNR))
+                        LLR = denoising_and_calc_LLR_awgn(res_noise_power, y_receive, u_BP_decoded, cnn_models[iter], device)
 
             # reconstruct noise
             noise_before_cnn = y_receive - (u_BP_decoded * (-2) + 1)
@@ -260,8 +285,7 @@ def generate_noise_samples(linear_code, top_config, net_config, train_config, bp
 
     fout_real_noise.close()
     fout_est_noise.close()
-
-    sess.close()
+    
     end = datetime.datetime.now()
 
     print("Time: %ds" % (end - start).seconds)
@@ -291,26 +315,21 @@ def analyze_residual_noise(linear_code, top_config, net_config, simutimes, batch
     if np.size(bp_iter_num) != net_id_tested + 1:
         print('Error: the length of bp_iter_num is not correct!')
         exit(0)
-    bp_decoder = BP_Decoder.BP_NetDecoder(H_matrix, batch_size)
+    
+    bp_decoder = BP_Decoder.BP_NetDecoder(H_matrix, batch_size).to(device)
 
     # build denoising network
-    conv_net = {}
-    denoise_net_in = {}
-    denoise_net_out = {}
+    conv_net_wrappers = {}
+    cnn_models = {}
 
     # build network for each CNN denoiser,
     for net_id in range(net_id_tested+1):
-        conv_net[net_id] = ConvNet.ConvNet(net_config, None, net_id)
-        denoise_net_in[net_id], denoise_net_out[net_id] = conv_net[net_id].build_network()
-
-    # init gragh
-    init = tf.global_variables_initializer()
-    sess = tf.Session()
-    sess.run(init)
-
-    # restore denoising network
-    for net_id in range(net_id_tested + 1):
-        conv_net[net_id].restore_network_with_model_id(sess, net_config.total_layers, model_id[0:(net_id+1)])
+        conv_net_wrappers[net_id] = ConvNet.ConvNet(net_config, None, net_id)
+        cnn_models[net_id] = ConvNet._CNNModel(net_config).to(device)
+        cnn_models[net_id].eval()
+        
+        # Restore
+        conv_net_wrappers[net_id].restore_network_with_model_id(cnn_models[net_id], net_config.total_layers, model_id[0:(net_id+1)])
 
     model_id_str = np.array2string(model_id, separator='_', formatter={'int': lambda d: "%d" % d})
     model_id_str = model_id_str[1:(len(model_id_str) - 1)]
@@ -333,15 +352,23 @@ def analyze_residual_noise(linear_code, top_config, net_config, simutimes, batch
             for iter in range(0, net_id_tested+1):
                 # BP decoding
                 u_BP_decoded = bp_decoder.decode(LLR.astype(np.float32), bp_iter_num[iter])
+                
+                # Manual Inference Steps instead of sess.run
                 noise_before_cnn = y_receive - (u_BP_decoded * (-2) + 1)
-                noise_after_cnn = sess.run(denoise_net_out[iter], feed_dict={denoise_net_in[iter]: noise_before_cnn})
+                
+                # Torch Inference
+                noise_before_tensor = torch.from_numpy(noise_before_cnn).float().to(device)
+                with torch.no_grad():
+                    noise_after_cnn_tensor = cnn_models[iter](noise_before_tensor)
+                noise_after_cnn = noise_after_cnn_tensor.cpu().numpy()
+                
                 s_mod_plus_res_noise = y_receive - noise_after_cnn
                 if iter < net_id_tested:  # calculate the LLR for next BP decoding
                     if top_config.update_llr_with_epdf:
-                        prob_tmp = conv_net[iter].get_res_noise_pdf(model_id).get(np.float32(SNR))
+                        prob_tmp = conv_net_wrappers[iter].get_res_noise_pdf(model_id).get(np.float32(SNR))
                         LLR = calc_LLR_epdf(prob_tmp, s_mod_plus_res_noise)
                     else:
-                        res_noise_power = conv_net[iter].get_res_noise_power(model_id).get(np.float32(SNR))
+                        res_noise_power = conv_net_wrappers[iter].get_res_noise_power(model_id).get(np.float32(SNR))
                         LLR = s_mod_plus_res_noise * 2.0 / res_noise_power
             if top_config.update_llr_with_epdf:
                 prob = stat_prob(s_mod_plus_res_noise - s_mod, prob)
@@ -362,4 +389,3 @@ def analyze_residual_noise(linear_code, top_config, net_config, simutimes, batch
     end = datetime.datetime.now()
     print('Time: %ds' % (end-start).seconds)
     print("end\n")
-    sess.close()

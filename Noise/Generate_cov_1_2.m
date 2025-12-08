@@ -2,7 +2,7 @@
 
 clear;
 
-eta = 0.8;
+eta = 0.9;
 N = 576;
 cov = zeros(N, N);
 for ii=1:N

@@ -1,154 +1,198 @@
-import tensorflow as tf
+import torch
+import torch.nn as nn
 import numpy as np
 
-
 class GetMatrixForBPNet:
-    # this class is to calculate the matrices used to perform BP process with matrix operation
+    # Fully converted to PyTorch operations to fix numpy shape errors
     def __init__(self, test_H, loc_nzero_row):
-        print("Construct the Matrics H class!\n")
-        self.H = test_H
-        self.m, self.n = np.shape(test_H)
-        self.H_sum_line = np.sum(self.H, axis=0)
-        self.H_sum_row = np.sum(self.H, axis=1)
+        # Ensure inputs are tensors
+        if not torch.is_tensor(test_H):
+            self.H = torch.tensor(test_H, dtype=torch.float32)
+        else:
+            self.H = test_H
+            
+        self.m, self.n = self.H.shape
+        
+        # .sum(dim=0) works on tensors
+        self.H_sum_line = self.H.sum(dim=0).long() 
+        self.H_sum_row = self.H.sum(dim=1).long()
         self.loc_nzero_row = loc_nzero_row
-        self.num_all_edges = np.size(self.loc_nzero_row[1, :])
+        
+        # Fix: Use shape[0] instead of .size to avoid ambiguity
+        self.num_all_edges = self.loc_nzero_row[1, :].shape[0]
 
+        # Calculate linear indices
         self.loc_nzero1 = self.loc_nzero_row[1, :] * self.n + self.loc_nzero_row[0, :]
-        self.loc_nzero2 = np.sort(self.loc_nzero1)
-        self.loc_nzero_line = np.append([np.mod(self.loc_nzero2, self.n)], [self.loc_nzero2 // self.n], axis=0)
+        
+        # Sort values
+        self.loc_nzero2 = torch.sort(self.loc_nzero1).values
+        
+        # Stack to create (2, num_edges)
+        row_indices = (self.loc_nzero2 % self.n).long()
+        col_indices = (self.loc_nzero2 // self.n).long()
+        self.loc_nzero_line = torch.stack([row_indices, col_indices])
+        
         self.loc_nzero4 = self.loc_nzero_line[0, :] * self.n + self.loc_nzero_line[1, :]
-        self.loc_nzero5 = np.sort(self.loc_nzero4)
+        self.loc_nzero5 = torch.sort(self.loc_nzero4).values
 
-    ##########################################################################################################
     def get_Matrix_VC(self):
-        H_x_to_xe0 = np.zeros([self.num_all_edges, self.n], np.float32)
-        H_sum_by_V_to_C = np.zeros([self.num_all_edges, self.num_all_edges], dtype=np.float32)
-        H_xe_last_to_y = np.zeros([self.n, self.num_all_edges], dtype=np.float32)
-        Map_row_to_line = np.zeros([self.num_all_edges, 1])
+        # Create tensors on the same device as H
+        device = self.H.device
+        
+        H_x_to_xe0 = torch.zeros([self.num_all_edges, self.n], dtype=torch.float32, device=device)
+        H_sum_by_V_to_C = torch.zeros([self.num_all_edges, self.num_all_edges], dtype=torch.float32, device=device)
+        H_xe_last_to_y = torch.zeros([self.n, self.num_all_edges], dtype=torch.float32, device=device)
+        
+        # Helper for finding indices
+        Map_row_to_line = torch.zeros([self.num_all_edges], dtype=torch.long, device=device)
 
-        for i in range(0, self.num_all_edges):
-            Map_row_to_line[i] = np.where(self.loc_nzero1 == self.loc_nzero2[i])
+        # PyTorch equivalent of finding indices
+        for i in range(self.num_all_edges):
+            # torch.nonzero replaces np.where
+            matches = torch.nonzero(self.loc_nzero1 == self.loc_nzero2[i], as_tuple=True)[0]
+            Map_row_to_line[i] = matches[0]
 
-        map_H_row_to_line = np.zeros([self.num_all_edges, self.num_all_edges], dtype=np.float32)
+        map_H_row_to_line = torch.zeros([self.num_all_edges, self.num_all_edges], dtype=torch.float32, device=device)
 
-        for i in range(0, self.num_all_edges):
-            map_H_row_to_line[i, int(Map_row_to_line[i])] = 1
+        for i in range(self.num_all_edges):
+            map_H_row_to_line[i, Map_row_to_line[i]] = 1
 
         count = 0
-        for i in range(0, self.n):
-            temp = count + self.H_sum_line[i]
-            H_sum_by_V_to_C[count:temp, count:temp] = 1
-            H_xe_last_to_y[i, count:temp] = 1
-            H_x_to_xe0[count:temp, i] = 1
-            for j in range(0, self.H_sum_line[i]):
-                H_sum_by_V_to_C[count + j, count + j] = 0
-            count = count + self.H_sum_line[i]
-        print("return Matrics V-C successfully!\n")
-        return H_x_to_xe0, np.matmul(H_sum_by_V_to_C, map_H_row_to_line), np.matmul(H_xe_last_to_y, map_H_row_to_line)
+        for i in range(self.n):
+            count_int = int(count)
+            degree = int(self.H_sum_line[i])
+            temp = count_int + degree
+            
+            # Fill ranges
+            H_sum_by_V_to_C[count_int:temp, count_int:temp] = 1
+            H_xe_last_to_y[i, count_int:temp] = 1
+            H_x_to_xe0[count_int:temp, i] = 1
+            
+            # Diagonal zeroing
+            for j in range(degree):
+                H_sum_by_V_to_C[count_int + j, count_int + j] = 0
+            
+            count = count + degree
 
-    ###################################################################################################
+        return H_x_to_xe0, torch.matmul(H_sum_by_V_to_C, map_H_row_to_line), torch.matmul(H_xe_last_to_y, map_H_row_to_line)
+
     def get_Matrix_CV(self):
+        device = self.H.device
+        H_sum_by_C_to_V = torch.zeros([self.num_all_edges, self.num_all_edges], dtype=torch.float32, device=device)
+        Map_line_to_row = torch.zeros([self.num_all_edges], dtype=torch.long, device=device)
 
-        H_sum_by_C_to_V = np.zeros([self.num_all_edges, self.num_all_edges], dtype=np.float32)
+        for i in range(self.num_all_edges):
+            # FIX: torch.nonzero returns a tensor, we explicitly take [0] to get the scalar index
+            matches = torch.nonzero(self.loc_nzero4 == self.loc_nzero5[i], as_tuple=True)[0]
+            Map_line_to_row[i] = matches[0]
 
-        Map_line_to_row = np.zeros([self.num_all_edges, 1])
+        map_H_line_to_row = torch.zeros([self.num_all_edges, self.num_all_edges], dtype=torch.float32, device=device)
 
-        for i in range(0, self.num_all_edges):
-            Map_line_to_row[i] = np.where(self.loc_nzero4 == self.loc_nzero5[i])
-
-        map_H_line_to_row = np.zeros([self.num_all_edges, self.num_all_edges], dtype=np.float32)
-
-        for i in range(0, np.size(self.loc_nzero1)):
-            map_H_line_to_row[i, int(Map_line_to_row[i])] = 1
+        for i in range(self.num_all_edges):
+            map_H_line_to_row[i, Map_line_to_row[i]] = 1
 
         count = 0
-        for i in range(0, self.m):
-            temp = count + self.H_sum_row[i]
-            H_sum_by_C_to_V[count:temp, count:temp] = 1
-            for j in range(0, self.H_sum_row[i]):
-                H_sum_by_C_to_V[count + j, count + j] = 0
-            count = count + self.H_sum_row[i]
-        print("return Matrics C-V successfully!\n")
-        return np.matmul(H_sum_by_C_to_V, map_H_line_to_row)
+        for i in range(self.m):
+            count_int = int(count)
+            degree = int(self.H_sum_row[i])
+            temp = count_int + degree
+            
+            H_sum_by_C_to_V[count_int:temp, count_int:temp] = 1
+            for j in range(degree):
+                H_sum_by_C_to_V[count_int + j, count_int + j] = 0
+            count = count + degree
+            
+        return torch.matmul(H_sum_by_C_to_V, map_H_line_to_row)
 
 
-class BP_NetDecoder:
-    def __init__(self, H, batch_size):
-        _, self.v_node_num = np.shape(H)
-        ii, jj = np.nonzero(H)
-        loc_nzero_row = np.array([ii, jj])
-        self.num_all_edges = np.size(loc_nzero_row[1, :])
-        gm1 = GetMatrixForBPNet(H[:, :], loc_nzero_row)
-        self.H_sumC_to_V = gm1.get_Matrix_CV()
-        self.H_x_to_xe0, self.H_sumV_to_C, self.H_xe_v_sumc_to_y = gm1.get_Matrix_VC()
-        self.batch_size = batch_size
-        self.llr_placeholder = tf.placeholder(tf.float32, [batch_size, self.v_node_num])
-        self.llr_into_bp_net, self.xe_0, self.xe_v2c_pre_iter_assign, self.start_next_iteration, self.dec_out = self.build_network()
-        self.llr_assign = self.llr_into_bp_net.assign(tf.transpose(self.llr_placeholder))  # transpose the llr matrix to adapt to the matrix operation in BP net decoder.
-
-        init = tf.global_variables_initializer()
-        self.sess = tf.Session() # open a session
-        print('Open a tf session!')
-        self.sess.run(init)
-
-    def __del__(self):
-        self.sess.close()
-        print('Close a tf session!')
-
+class BP_NetDecoder(nn.Module):
+    def __init__(self, H, batch_size=None):
+        super(BP_NetDecoder, self).__init__()
+        
+        # Convert incoming numpy H to Tensor immediately if it isn't one
+        if not torch.is_tensor(H):
+            self.H = torch.tensor(H, dtype=torch.float32)
+        else:
+            self.H = H.float()
+            
+        _, self.v_node_num = self.H.shape
+        
+        # Get nonzero indices using PyTorch
+        ii, jj = torch.nonzero(self.H, as_tuple=True)
+        loc_nzero_row = torch.stack([ii, jj])
+        
+        # Initialize the helper with Tensors
+        gm1 = GetMatrixForBPNet(self.H, loc_nzero_row)
+        
+        # These are now Tensors already
+        H_sumC_to_V = gm1.get_Matrix_CV()
+        H_x_to_xe0, H_sumV_to_C, H_xe_v_sumc_to_y = gm1.get_Matrix_VC()
+        
+        # Register as buffers (constants)
+        self.register_buffer('H_sumC_to_V', H_sumC_to_V)
+        self.register_buffer('H_x_to_xe0', H_x_to_xe0)
+        self.register_buffer('H_sumV_to_C', H_sumV_to_C)
+        self.register_buffer('H_xe_v_sumc_to_y', H_xe_v_sumc_to_y)
 
     def atanh(self, x):
-        x1 = tf.add(1.0, x)
-        x2 = tf.subtract((1.0), x)
-        x3 = tf.divide(x1, x2)
-        x4 = tf.log(x3)
-        return tf.divide(x4, (2.0))
+        return 0.5 * torch.log((1 + x) / (1 - x + 1e-10))
 
-    def one_bp_iteration(self, xe_v2c_pre_iter, H_sumC_to_V, H_sumV_to_C, xe_0):
-        xe_tanh = tf.tanh(tf.to_double(tf.truediv(xe_v2c_pre_iter, [2.0])))
-        xe_tanh = tf.to_float(xe_tanh)
-        xe_tanh_temp = tf.sign(xe_tanh)
-        xe_sum_log_img = tf.matmul(H_sumC_to_V, tf.multiply(tf.truediv((1 - xe_tanh_temp), [2.0]), [3.1415926]))
-        xe_sum_log_real = tf.matmul(H_sumC_to_V, tf.log(1e-8 + tf.abs(xe_tanh)))
-        xe_sum_log_complex = tf.complex(xe_sum_log_real, xe_sum_log_img)
-        xe_product = tf.real(tf.exp(xe_sum_log_complex))
-        xe_product_temp = tf.multiply(tf.sign(xe_product), -2e-7)
-        xe_pd_modified = tf.add(xe_product, xe_product_temp)
-        xe_v_sumc = tf.multiply(self.atanh(xe_pd_modified), [2.0])
-        xe_c_sumv = tf.add(xe_0, tf.matmul(H_sumV_to_C, xe_v_sumc))
+    def one_bp_iteration(self, xe_v2c_pre_iter, xe_0):
+        # 1. Tanh
+        xe_tanh = torch.tanh(xe_v2c_pre_iter.double() / 2.0).float()
+        xe_tanh_temp = torch.sign(xe_tanh)
+        
+        # 2. Check Node Update
+        # 1-sign returns 0 for pos, 2 for neg. /2 -> 0 for pos, 1 for neg.
+        xe_sum_log_img = torch.matmul(self.H_sumC_to_V, (1 - xe_tanh_temp) / 2.0 * 3.1415926)
+        xe_sum_log_real = torch.matmul(self.H_sumC_to_V, torch.log(1e-8 + torch.abs(xe_tanh)))
+        
+        xe_sum_log_complex = torch.complex(xe_sum_log_real, xe_sum_log_img)
+        xe_product = torch.real(torch.exp(xe_sum_log_complex))
+        
+        # Avoid zero issues
+        xe_product_temp = torch.sign(xe_product) * -2e-7
+        xe_pd_modified = xe_product + xe_product_temp
+        
+        # 3. Variable Node Update
+        xe_v_sumc = self.atanh(xe_pd_modified) * 2.0
+        xe_c_sumv = xe_0 + torch.matmul(self.H_sumV_to_C, xe_v_sumc)
+        
         return xe_v_sumc, xe_c_sumv
 
-    def build_network(self): # build the network for one BP iteration
-        # BP initialization
-        llr_into_bp_net = tf.Variable(np.ones([self.v_node_num, self.batch_size], dtype=np.float32))
-        xe_0 = tf.matmul(self.H_x_to_xe0, llr_into_bp_net)
-        xe_v2c_pre_iter = tf.Variable(np.ones([self.num_all_edges, self.batch_size], dtype=np.float32)) # the v->c messages of the previous iteration
-        xe_v2c_pre_iter_assign = xe_v2c_pre_iter.assign(xe_0)
+    def forward(self, llr_in, bp_iter_num):
+        llr_transposed = llr_in.t()
+        xe_0 = torch.matmul(self.H_x_to_xe0, llr_transposed)
+        xe_v2c = xe_0.clone()
+        
+        for i in range(bp_iter_num - 1):
+            xe_v_sumc, xe_c_sumv = self.one_bp_iteration(xe_v2c, xe_0)
+            xe_v2c = xe_c_sumv
+            
+        # Final marginals
+        if bp_iter_num == 1:
+             xe_v_sumc, _ = self.one_bp_iteration(xe_v2c, xe_0)
+        else:
+             # Recompute v_sumc from the last c_sumv
+             xe_v_sumc, _ = self.one_bp_iteration(xe_v2c, xe_0)
 
-        # one iteration
-        H_sumC_to_V = tf.constant(self.H_sumC_to_V, dtype=tf.float32)
-        H_sumV_to_C = tf.constant(self.H_sumV_to_C, dtype=tf.float32)
-        xe_v_sumc, xe_c_sumv = self.one_bp_iteration(xe_v2c_pre_iter, H_sumC_to_V, H_sumV_to_C, xe_0)
-
-        # start the next iteration
-        start_next_iteration = xe_v2c_pre_iter.assign(xe_c_sumv)
-
-        # get the final marginal probability and decoded results
-        bp_out_llr = tf.add(llr_into_bp_net, tf.matmul(self.H_xe_v_sumc_to_y, xe_v_sumc))
-        dec_out = tf.transpose(tf.floordiv(1-tf.to_int32(tf.sign(bp_out_llr)), 2))
-
-        return llr_into_bp_net, xe_0, xe_v2c_pre_iter_assign, start_next_iteration, dec_out
+        bp_out_llr = llr_transposed + torch.matmul(self.H_xe_v_sumc_to_y, xe_v_sumc)
+        dec_out = torch.floor_divide(1 - torch.sign(bp_out_llr).int(), 2)
+        
+        return dec_out.t()
 
     def decode(self, llr_in, bp_iter_num):
-        real_batch_size, num_v_node = np.shape(llr_in)
-        if real_batch_size != self.batch_size:  # padding zeros
-            llr_in = np.append(llr_in, np.zeros([self.batch_size-real_batch_size, num_v_node], dtype=np.float32), 0)  # re-create an array and will not influence the value in
-            # original llr array.
-        self.sess.run(self.llr_assign, feed_dict={self.llr_placeholder: llr_in})
-        self.sess.run(self.xe_v2c_pre_iter_assign)
-        for iter in range(0, bp_iter_num-1):
-            self.sess.run(self.start_next_iteration)
-        y_dec = self.sess.run(self.dec_out)
-        if real_batch_size != self.batch_size:
-            y_dec = y_dec[0:real_batch_size, :]
-
-        return y_dec
+        # Wrapper to maintain compatibility with calling code
+        self.eval() 
+        with torch.no_grad():
+            if isinstance(llr_in, np.ndarray):
+                llr_tensor = torch.from_numpy(llr_in).float()
+            else:
+                llr_tensor = llr_in.float()
+            
+            device = self.H_sumC_to_V.device
+            llr_tensor = llr_tensor.to(device)
+            
+            y_dec = self.forward(llr_tensor, bp_iter_num)
+            
+            return y_dec.cpu().numpy()

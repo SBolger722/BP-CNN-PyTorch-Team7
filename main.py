@@ -40,7 +40,7 @@ elif top_config.function == 'Train':
     conv_net = ConvNet.ConvNet(net_config, train_config, net_id)
     conv_net.train_network(top_config.model_id)
 elif top_config.function == 'Simulation':
-    batch_size = 5000
+    batch_size = 50
     if top_config.analyze_res_noise:
         simutimes_for_anal_res_power = int(np.ceil(5e6 / float(top_config.K_code * batch_size)) * batch_size)
         ibd.analyze_residual_noise(code, top_config, net_config, simutimes_for_anal_res_power, batch_size)
